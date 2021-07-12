@@ -51,6 +51,9 @@ def load_data(data_cfg: dict, datasets: list = None)\
     trg_lang = data_cfg["trg"]
     train_path = data_cfg.get("train", None)
     dev_path = data_cfg.get("dev", None)
+    if dev_path and ',' in dev_path:
+        dev_path = dev_path.split(',')
+        
     test_path = data_cfg.get("test", None)
 
     if train_path is None and dev_path is None and test_path is None:
@@ -117,9 +120,17 @@ def load_data(data_cfg: dict, datasets: list = None)\
     dev_data = None
     if "dev" in datasets and dev_path is not None:
         logger.info("Loading dev data...")
-        dev_data = TranslationDataset(path=dev_path,
-                                      exts=("." + src_lang, "." + trg_lang),
-                                      fields=(src_field, trg_field))
+        if isinstance(dev_path, list):
+            dev_data = []
+            for path in dev_path:
+                dev_data_part = TranslationDataset(path=path,
+                                        exts=("." + src_lang, "." + trg_lang),
+                                        fields=(src_field, trg_field))
+                dev_data.append(dev_data_part)
+        else:
+            dev_data = TranslationDataset(path=dev_path,
+                                        exts=("." + src_lang, "." + trg_lang),
+                                        fields=(src_field, trg_field))
 
     test_data = None
     if "test" in datasets and test_path is not None:

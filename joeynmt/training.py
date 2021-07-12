@@ -13,6 +13,8 @@ import sys
 import collections
 import pathlib
 import numpy as np
+from statistics import mean
+
 
 import torch
 from torch import Tensor
@@ -28,6 +30,7 @@ from joeynmt.helpers import log_data_info, load_config, log_cfg, \
     ConfigurationError
 from joeynmt.model import Model, _DataParallel
 from joeynmt.prediction import validate_on_data
+
 from joeynmt.loss import XentLoss
 from joeynmt.data import load_data, make_data_iter
 from joeynmt.builders import build_optimizer, build_scheduler, \
@@ -474,6 +477,7 @@ class TrainManager:
                     if self.stats.steps % self.validation_freq == 0:
                         valid_duration = self._validate(valid_data, epoch_no)
                         total_valid_duration += valid_duration
+                    
 
                 if self.stats.stop:
                     break
@@ -540,9 +544,131 @@ class TrainManager:
 
         return norm_batch_loss.item()
 
+    def _validate_multi_dev(self, valid_data, epoch_no):
+        valid_start_time = time.time()
+
+        # valid_score, valid_loss, valid_ppl, valid_sources,
+        # valid_sources_raw, valid_references, valid_hypotheses,
+        # valid_hypotheses_raw, valid_attention_scores
+        validation_results = [] 
+        
+        for vd in valid_data:
+            validation_result = validate_on_data(
+                    batch_size=self.eval_batch_size,
+                    batch_class=self.batch_class,
+                    data=vd,
+                    eval_metric=self.eval_metric,
+                    level=self.level, model=self.model,
+                    use_cuda=self.use_cuda,
+                    max_output_length=self.max_output_length,
+                    compute_loss=True,
+                    beam_size=1,                # greedy validations
+                    batch_type=self.eval_batch_type,
+                    postprocess=True,           # always remove BPE for validation
+                    bpe_type=self.bpe_type,     # "subword-nmt" or "sentencepiece"
+                    sacrebleu=self.sacrebleu,   # sacrebleu options
+                    n_gpu=self.n_gpu
+                )
+            validation_results.append(validation_result)
+        
+        v_res_transposed = list(zip(*validation_results))
+        print(v_res_transposed[0])
+        print(v_res_transposed[2])
+
+        valid_score = mean(v_res_transposed[0])
+
+        valid_loss = torch.mean(torch.stack(v_res_transposed[1]))
+        valid_ppl = torch.mean(torch.stack(v_res_transposed[2]))
+        
+        self.tb_writer.add_scalar("valid/valid_loss", valid_loss,
+                                  self.stats.steps)
+        self.tb_writer.add_scalar("valid/valid_score", valid_score,
+                                  self.stats.steps)
+        self.tb_writer.add_scalar("valid/valid_ppl", valid_ppl,
+                                  self.stats.steps)
+
+        if self.early_stopping_metric == "loss":
+            ckpt_score = valid_loss
+        elif self.early_stopping_metric in ["ppl", "perplexity"]:
+            ckpt_score = valid_ppl
+        else:
+            ckpt_score = valid_score
+
+        if self.scheduler is not None \
+                and self.scheduler_step_at == "validation":
+            self.scheduler.step(ckpt_score)
+
+        new_best = False
+        if self.stats.is_best(ckpt_score):
+            self.stats.best_ckpt_score = ckpt_score
+            self.stats.best_ckpt_iter = self.stats.steps
+            logger.info('Hooray! New best validation result [%s]!',
+                        self.early_stopping_metric)
+            if self.ckpt_queue.maxlen > 0:
+                logger.info("Saving new checkpoint.")
+                new_best = True
+                self._save_checkpoint(new_best)
+        elif self.save_latest_checkpoint:
+            self._save_checkpoint(new_best)
+
+
+        valid_duration = time.time() - valid_start_time
+        # append to validation report
+        for index, validation_result in enumerate(validation_results):
+
+            valid_score = validation_result[0]
+            valid_loss = validation_result[1]
+            valid_ppl = validation_result[2]
+            valid_sources = validation_result[3]
+            valid_sources_raw = validation_result[4]
+            valid_references = validation_result[5]
+            valid_hypotheses = validation_result[6]
+            valid_hypotheses_raw = validation_result[7]
+
+            logger.info(
+                'Validation result for dev set %d (greedy) at epoch %3d, '
+                'step %8d: %s: %6.2f, loss: %8.4f, ppl: %8.4f, '
+                'duration: %.4fs', index + 1,  epoch_no + 1, self.stats.steps, self.eval_metric,
+                valid_score, valid_loss, valid_ppl, valid_duration)
+
+            self._add_report(valid_score=valid_score,
+                            valid_loss=valid_loss,
+                            valid_ppl=valid_ppl,
+                            eval_metric=self.eval_metric,
+                            new_best=new_best)
+
+            self._log_examples(sources_raw=[v for v in valid_sources_raw],
+                            sources=valid_sources,
+                            hypotheses_raw=valid_hypotheses_raw,
+                            hypotheses=valid_hypotheses,
+                            references=valid_references)
+
+            
+            
+
+            # store validation set outputs
+            self._store_outputs(valid_hypotheses)
+        
+        
+
+        # # store attention plots for selected valid sentences
+        # if valid_attention_scores:
+        #     store_attention_plots(attentions=valid_attention_scores,
+        #                           targets=valid_hypotheses_raw,
+        #                           sources=[s for s in valid_data.src],
+        #                           indices=self.log_valid_sents,
+        #                           output_prefix="{}/att.{}".format(
+        #                               self.model_dir, self.stats.steps),
+        #                           tb_writer=self.tb_writer,
+        #                           steps=self.stats.steps)
+
+        return valid_duration
+
     def _validate(self, valid_data, epoch_no):
         valid_start_time = time.time()
 
+        if isinstance(valid_data, list):
+            return self._validate_multi_dev(valid_data, epoch_no)
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
         valid_hypotheses_raw, valid_attention_scores = \
@@ -563,6 +689,7 @@ class TrainManager:
                 n_gpu=self.n_gpu
             )
 
+        
         self.tb_writer.add_scalar("valid/valid_loss", valid_loss,
                                   self.stats.steps)
         self.tb_writer.add_scalar("valid/valid_score", valid_score,
